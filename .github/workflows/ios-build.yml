@@ -1,0 +1,125 @@
+name: iOS Build
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+jobs:
+  build-ios:
+    runs-on: macos-latest
+    
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          repository: hardik-kanajariya/apanavyapar
+          token: ${{ secrets.PAT_TOKEN }}
+          path: repo
+
+      - name: Move to admin-app directory
+        run: |
+          cd repo/admin-app
+          echo "Current directory: $(pwd)"
+          ls -la
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: repo/admin-app/package-lock.json
+
+      - name: Install dependencies
+        working-directory: repo/admin-app
+        run: npm ci
+
+      - name: Setup Ruby
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.2'
+          bundler-cache: true
+          working-directory: repo/admin-app/ios
+
+      - name: Install CocoaPods dependencies
+        working-directory: repo/admin-app/ios
+        run: |
+          bundle install
+          bundle exec pod install
+
+      - name: Setup Xcode
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
+
+      - name: Build iOS App (Archive)
+        working-directory: repo/admin-app/ios
+        run: |
+          # Get the scheme name (usually the project name)
+          SCHEME=$(xcodebuild -list -workspace *.xcworkspace 2>/dev/null | grep -A 100 "Schemes:" | grep -v "Schemes:" | head -1 | xargs)
+          
+          if [ -z "$SCHEME" ]; then
+            # Fallback: try to find scheme from xcodeproj
+            SCHEME=$(xcodebuild -list -project *.xcodeproj 2>/dev/null | grep -A 100 "Schemes:" | grep -v "Schemes:" | head -1 | xargs)
+          fi
+          
+          echo "Using scheme: $SCHEME"
+          
+          # Clean and build archive
+          xcodebuild clean archive \
+            -workspace *.xcworkspace \
+            -scheme "$SCHEME" \
+            -sdk iphoneos \
+            -configuration Release \
+            -archivePath $RUNNER_TEMP/app.xcarchive \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            DEVELOPMENT_TEAM="" \
+            -allowProvisioningUpdates
+
+      - name: Export IPA
+        working-directory: repo/admin-app/ios
+        run: |
+          # Create export options plist for ad-hoc/development export without signing
+          cat > $RUNNER_TEMP/ExportOptions.plist << EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>method</key>
+            <string>development</string>
+            <key>compileBitcode</key>
+            <false/>
+            <key>signingStyle</key>
+            <string>automatic</string>
+          </dict>
+          </plist>
+          EOF
+          
+          # Export IPA from archive
+          xcodebuild -exportArchive \
+            -archivePath $RUNNER_TEMP/app.xcarchive \
+            -exportOptionsPlist $RUNNER_TEMP/ExportOptions.plist \
+            -exportPath $RUNNER_TEMP/ipa \
+            -allowProvisioningUpdates || true
+          
+          # If export fails, create IPA manually from the .app
+          if [ ! -f $RUNNER_TEMP/ipa/*.ipa ]; then
+            echo "Standard export failed, creating IPA manually..."
+            mkdir -p $RUNNER_TEMP/Payload
+            cp -r $RUNNER_TEMP/app.xcarchive/Products/Applications/*.app $RUNNER_TEMP/Payload/
+            cd $RUNNER_TEMP
+            zip -r app.ipa Payload
+            mkdir -p ipa
+            mv app.ipa ipa/
+          fi
+
+      - name: Upload IPA Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-ipa-build
+          path: ${{ runner.temp }}/ipa/*.ipa
+          retention-days: 14
+          if-no-files-found: error
