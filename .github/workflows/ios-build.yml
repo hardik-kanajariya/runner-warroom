@@ -85,7 +85,7 @@ jobs:
         with:
           ruby-version: '3.2'
           bundler-cache: true
-          working-directory: repo/admin-app/ios
+          working-directory: ${{ github.workspace }}/repo/admin-app/ios
 
       - name: Install CocoaPods dependencies
         working-directory: repo/admin-app/ios
