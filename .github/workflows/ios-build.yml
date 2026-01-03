@@ -80,18 +80,16 @@ jobs:
         working-directory: repo/admin-app
         run: npm install
 
-      - name: Setup Ruby
-        uses: ruby/setup-ruby@v1
-        with:
-          ruby-version: '3.2'
-          bundler-cache: true
-          working-directory: ${{ github.workspace }}/repo/admin-app/ios
+      - name: Verify iOS directory exists
+        run: |
+          echo "📁 Checking iOS directory:"
+          ls -la repo/admin-app/ios/ || echo "❌ ios directory NOT FOUND - Make sure your React Native project has an ios folder"
 
       - name: Install CocoaPods dependencies
         working-directory: repo/admin-app/ios
         run: |
-          bundle install
-          bundle exec pod install
+          sudo gem install cocoapods
+          pod install
 
       - name: Setup Xcode
         uses: maxim-lobanov/setup-xcode@v1
