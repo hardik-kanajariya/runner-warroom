@@ -78,7 +78,7 @@ jobs:
 
       - name: Install dependencies
         working-directory: repo/admin-app
-        run: npm ci
+        run: npm install
 
       - name: Setup Ruby
         uses: ruby/setup-ruby@v1
