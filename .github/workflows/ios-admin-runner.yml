@@ -1,4 +1,4 @@
-name: iOS Build
+name: iOS Build - Admin App
 
 on:
   workflow_dispatch:
@@ -20,10 +20,7 @@ on:
 jobs:
   build-ios:
     runs-on: macos-latest
-    
-    env:
-      # Check if App Store secrets are configured
-      HAS_APPSTORE_CONFIG: ${{ secrets.APP_STORE_CONNECT_API_KEY_ID != '' && secrets.APP_STORE_CONNECT_ISSUER_ID != '' && secrets.APPLE_TEAM_ID != '' }}
+    timeout-minutes: 60
     
     steps:
       - name: Checkout Repository
@@ -44,15 +41,15 @@ jobs:
           echo ""
           echo "📁 Inside repo/admin-app:"
           ls -la repo/admin-app/ || echo "❌ admin-app directory NOT FOUND"
+          echo ""
+          echo "📁 Inside repo/admin-app/ios:"
+          ls -la repo/admin-app/ios/ || echo "❌ ios directory NOT FOUND"
 
       - name: Determine Build Type
         id: build_config
         run: |
-          # If manually triggered, use the input; otherwise check if secrets exist
           if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
             BUILD_TYPE="${{ inputs.build_type }}"
-          elif [ "${{ secrets.APP_STORE_CONNECT_API_KEY_ID }}" != "" ] && [ "${{ secrets.APPLE_TEAM_ID }}" != "" ]; then
-            BUILD_TYPE="appstore"
           else
             BUILD_TYPE="development"
           fi
@@ -63,52 +60,82 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '24'
-
-      - name: Get package-lock hash
-        id: pkg-hash
-        run: |
-          HASH=$(md5 -q repo/admin-app/package-lock.json 2>/dev/null || echo "no-lock-file")
-          echo "hash=$HASH" >> $GITHUB_OUTPUT
+          node-version: '20'
 
       - name: Cache npm dependencies
         uses: actions/cache@v4
         with:
-          path: ~/.npm
-          key: ${{ runner.os }}-npm-${{ steps.pkg-hash.outputs.hash }}
+          path: |
+            ~/.npm
+            repo/admin-app/node_modules
+          key: ${{ runner.os }}-npm-admin-${{ hashFiles('repo/admin-app/package-lock.json') }}
           restore-keys: |
-            ${{ runner.os }}-npm-
+            ${{ runner.os }}-npm-admin-
 
-      - name: Install dependencies
+      - name: Install JS dependencies
         working-directory: repo/admin-app
-        run: npm install
-
-      - name: Verify iOS directory exists
         run: |
-          echo "📁 Checking iOS directory:"
-          ls -la repo/admin-app/ios/ || echo "❌ ios directory NOT FOUND - Make sure your React Native project has an ios folder"
+          npm ci || npm install
+          echo "✅ Node modules installed"
+
+      - name: Setup Ruby
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.2'
+          bundler-cache: true
+          working-directory: repo/admin-app
+
+      - name: Cache CocoaPods
+        uses: actions/cache@v4
+        with:
+          path: |
+            repo/admin-app/ios/Pods
+            ~/Library/Caches/CocoaPods
+          key: ${{ runner.os }}-pods-admin-${{ hashFiles('repo/admin-app/ios/Podfile.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-pods-admin-
 
       - name: Install CocoaPods dependencies
-        working-directory: repo/admin-app/ios
+        working-directory: repo/admin-app
         run: |
-          sudo gem install cocoapods
-          pod install
+          # Use bundler if Gemfile exists
+          if [ -f "Gemfile" ]; then
+            bundle install
+            cd ios
+            bundle exec pod install --repo-update
+          else
+            cd ios
+            gem install cocoapods
+            pod install --repo-update
+          fi
+          echo "✅ CocoaPods installed"
 
       - name: Setup Xcode
         uses: maxim-lobanov/setup-xcode@v1
         with:
           xcode-version: latest-stable
 
-      - name: Get Scheme Name
+      - name: Get Workspace and Scheme
         id: scheme
         working-directory: repo/admin-app/ios
         run: |
-          SCHEME=$(xcodebuild -list -workspace *.xcworkspace 2>/dev/null | grep -A 100 "Schemes:" | grep -v "Schemes:" | head -1 | xargs)
+          # Find workspace
+          WORKSPACE=$(ls -1 *.xcworkspace 2>/dev/null | head -1)
+          if [ -z "$WORKSPACE" ]; then
+            echo "❌ No .xcworkspace found!"
+            exit 1
+          fi
+          echo "WORKSPACE=$WORKSPACE" >> $GITHUB_OUTPUT
+          echo "📁 Workspace: $WORKSPACE"
+          
+          # Get scheme name
+          SCHEME=$(xcodebuild -workspace "$WORKSPACE" -list 2>/dev/null | awk '/Schemes:/,/^$/' | grep -v "Schemes:" | grep -v "^$" | head -1 | xargs)
           if [ -z "$SCHEME" ]; then
-            SCHEME=$(xcodebuild -list -project *.xcodeproj 2>/dev/null | grep -A 100 "Schemes:" | grep -v "Schemes:" | head -1 | xargs)
+            # Fallback: use app name from workspace
+            SCHEME=$(echo "$WORKSPACE" | sed 's/.xcworkspace//')
           fi
           echo "SCHEME_NAME=$SCHEME" >> $GITHUB_OUTPUT
-          echo "📱 Found scheme: $SCHEME"
+          echo "📱 Scheme: $SCHEME"
 
       # ==========================================
       # DEVELOPMENT BUILD (No signing required)
@@ -117,60 +144,96 @@ jobs:
         if: steps.build_config.outputs.BUILD_TYPE == 'development'
         working-directory: repo/admin-app/ios
         run: |
-          echo "🔧 Building DEVELOPMENT (unsigned) IPA..."
+          echo "🔧 Building DEVELOPMENT (unsigned) build..."
           
+          WORKSPACE="${{ steps.scheme.outputs.WORKSPACE }}"
           SCHEME="${{ steps.scheme.outputs.SCHEME_NAME }}"
           
-          # Clean and build archive without signing
-          xcodebuild clean archive \
-            -workspace *.xcworkspace \
+          echo "Using Workspace: $WORKSPACE"
+          echo "Using Scheme: $SCHEME"
+          
+          # Build archive without code signing
+          set -o pipefail
+          xcodebuild \
+            -workspace "$WORKSPACE" \
             -scheme "$SCHEME" \
             -sdk iphoneos \
             -configuration Release \
-            -archivePath $RUNNER_TEMP/app.xcarchive \
-            CODE_SIGN_IDENTITY="" \
+            -archivePath "$RUNNER_TEMP/app.xcarchive" \
+            -destination 'generic/platform=iOS' \
+            CODE_SIGN_IDENTITY="-" \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGNING_ALLOWED=NO \
-            DEVELOPMENT_TEAM="" \
-            -allowProvisioningUpdates
+            AD_HOC_CODE_SIGNING_ALLOWED=YES \
+            archive 2>&1 | tee build.log | tail -100
           
-          # Create IPA manually from the .app
+          # Check if archive was created
+          if [ ! -d "$RUNNER_TEMP/app.xcarchive" ]; then
+            echo "❌ Archive failed! Last 200 lines of build log:"
+            tail -200 build.log
+            exit 1
+          fi
+          
+          # Create IPA from archive
           echo "📦 Creating IPA package..."
-          mkdir -p $RUNNER_TEMP/Payload
-          cp -r $RUNNER_TEMP/app.xcarchive/Products/Applications/*.app $RUNNER_TEMP/Payload/
-          cd $RUNNER_TEMP
-          zip -r app-dev-unsigned.ipa Payload
-          mkdir -p ipa
-          mv app-dev-unsigned.ipa ipa/
+          mkdir -p "$RUNNER_TEMP/Payload"
           
-          echo "✅ Development IPA created successfully!"
+          # Find and copy .app
+          APP_PATH=$(find "$RUNNER_TEMP/app.xcarchive/Products/Applications" -name "*.app" -type d 2>/dev/null | head -1)
+          if [ -z "$APP_PATH" ]; then
+            echo "❌ No .app found in archive!"
+            echo "Archive contents:"
+            find "$RUNNER_TEMP/app.xcarchive" -type d | head -20
+            exit 1
+          fi
+          
+          echo "Found app: $APP_PATH"
+          cp -r "$APP_PATH" "$RUNNER_TEMP/Payload/"
+          
+          cd "$RUNNER_TEMP"
+          zip -r "admin-app-dev-unsigned.ipa" Payload
+          
+          mkdir -p ipa
+          mv "admin-app-dev-unsigned.ipa" ipa/
+          
+          echo "✅ Development IPA created!"
+          ls -la ipa/
 
       # ==========================================
       # APP STORE BUILD (Signed with Fastlane)
       # ==========================================
       - name: Install Fastlane
         if: steps.build_config.outputs.BUILD_TYPE == 'appstore'
-        run: gem install fastlane
+        run: |
+          gem install fastlane
+          echo "✅ Fastlane installed"
 
       - name: Create App Store Connect API Key
         if: steps.build_config.outputs.BUILD_TYPE == 'appstore'
-        working-directory: repo/admin-app/ios
         env:
           APP_STORE_CONNECT_API_KEY_ID: ${{ secrets.APP_STORE_CONNECT_API_KEY_ID }}
           APP_STORE_CONNECT_API_KEY_CONTENT: ${{ secrets.APP_STORE_CONNECT_API_KEY_CONTENT }}
         run: |
           mkdir -p ~/.appstoreconnect/private_keys
           echo "$APP_STORE_CONNECT_API_KEY_CONTENT" > ~/.appstoreconnect/private_keys/AuthKey_${APP_STORE_CONNECT_API_KEY_ID}.p8
+          echo "✅ API Key created"
 
       - name: Create Keychain
         if: steps.build_config.outputs.BUILD_TYPE == 'appstore'
         run: |
-          security create-keychain -p "temp_password" $RUNNER_TEMP/app-signing.keychain-db
-          security set-keychain-settings -lut 21600 $RUNNER_TEMP/app-signing.keychain-db
-          security unlock-keychain -p "temp_password" $RUNNER_TEMP/app-signing.keychain-db
-          security list-keychain -d user -s $RUNNER_TEMP/app-signing.keychain-db
+          KEYCHAIN_PATH="$RUNNER_TEMP/app-signing.keychain-db"
+          KEYCHAIN_PASSWORD="temp_password_$(date +%s)"
+          
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security list-keychain -d user -s "$KEYCHAIN_PATH"
+          
+          echo "KEYCHAIN_PATH=$KEYCHAIN_PATH" >> $GITHUB_ENV
+          echo "KEYCHAIN_PASSWORD=$KEYCHAIN_PASSWORD" >> $GITHUB_ENV
+          echo "✅ Keychain created"
 
-      - name: Setup Fastlane & Sync Certificates
+      - name: Setup Fastlane & Build
         if: steps.build_config.outputs.BUILD_TYPE == 'appstore'
         working-directory: repo/admin-app/ios
         env:
@@ -181,12 +244,12 @@ jobs:
           MATCH_PASSWORD: ${{ secrets.MATCH_PASSWORD }}
           MATCH_GIT_URL: ${{ secrets.MATCH_GIT_URL }}
           MATCH_GIT_BASIC_AUTHORIZATION: ${{ secrets.MATCH_GIT_BASIC_AUTHORIZATION }}
-          KEYCHAIN_PATH: ${{ runner.temp }}/app-signing.keychain-db
+          SCHEME_NAME: ${{ steps.scheme.outputs.SCHEME_NAME }}
         run: |
           echo "🔐 Setting up Fastlane for App Store build..."
           
           mkdir -p fastlane
-          cat > fastlane/Fastfile << 'EOF'
+          cat > fastlane/Fastfile << 'FASTFILE'
           default_platform(:ios)
 
           platform :ios do
@@ -206,22 +269,19 @@ jobs:
                 git_url: ENV["MATCH_GIT_URL"],
                 git_basic_authorization: ENV["MATCH_GIT_BASIC_AUTHORIZATION"],
                 keychain_name: ENV["KEYCHAIN_PATH"],
-                keychain_password: "temp_password",
+                keychain_password: ENV["KEYCHAIN_PASSWORD"],
                 api_key: api_key,
-                readonly: false
+                readonly: true,
+                verbose: true
               )
             end
 
             desc "Build and export IPA"
             lane :build_ipa do
-              api_key = app_store_connect_api_key(
-                key_id: ENV["APP_STORE_CONNECT_API_KEY_ID"],
-                issuer_id: ENV["APP_STORE_CONNECT_ISSUER_ID"],
-                key_filepath: File.expand_path("~/.appstoreconnect/private_keys/AuthKey_#{ENV['APP_STORE_CONNECT_API_KEY_ID']}.p8"),
-                in_house: false
-              )
-
+              workspace = Dir.glob("*.xcworkspace").first
+              
               update_code_signing_settings(
+                path: workspace.sub('.xcworkspace', '.xcodeproj'),
                 use_automatic_signing: false,
                 team_id: ENV["APPLE_TEAM_ID"],
                 bundle_identifier: ENV["BUNDLE_IDENTIFIER"],
@@ -230,24 +290,70 @@ jobs:
               )
 
               build_app(
-                workspace: Dir.glob("*.xcworkspace").first,
+                workspace: workspace,
                 scheme: ENV["SCHEME_NAME"],
                 configuration: "Release",
                 export_method: "app-store",
-                output_directory: ENV["RUNNER_TEMP"] + "/ipa",
-                output_name: "app-appstore.ipa",
+                output_directory: "#{ENV['RUNNER_TEMP']}/ipa",
+                output_name: "admin-app-appstore.ipa",
+                clean: true,
                 export_options: {
                   signingStyle: "manual",
-                  teamID: ENV["APPLE_TEAM_ID"]
+                  teamID: ENV["APPLE_TEAM_ID"],
+                  provisioningProfiles: {
+                    ENV["BUNDLE_IDENTIFIER"] => "match AppStore #{ENV['BUNDLE_IDENTIFIER']}"
+                  }
                 }
               )
             end
+            
+            desc "Full build flow"
+            lane :release do
+              sync_certs
+              build_ipa
+            end
           end
-          EOF
+          FASTFILE
+          
+          echo "🏗️ Building App Store IPA..."
+          fastlane release
+          echo "✅ App Store IPA created!"
+          ls -la "$RUNNER_TEMP/ipa/" || true
 
-          fastlane sync_certs
+      # ==========================================
+      # UPLOAD ARTIFACT
+      # ==========================================
+      - name: Upload IPA Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: admin-ios-${{ steps.build_config.outputs.BUILD_TYPE }}-${{ github.run_number }}
+          path: ${{ runner.temp }}/ipa/*.ipa
+          retention-days: 30
+          if-no-files-found: error
 
-      - name: Build App Store IPA
+      - name: Build Summary
+        run: |
+          echo "## 📱 iOS Build Complete - Admin App" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Property | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Build Type | **${{ steps.build_config.outputs.BUILD_TYPE }}** |" >> $GITHUB_STEP_SUMMARY
+          echo "| Workspace | ${{ steps.scheme.outputs.WORKSPACE }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Scheme | ${{ steps.scheme.outputs.SCHEME_NAME }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Artifact | admin-ios-${{ steps.build_config.outputs.BUILD_TYPE }}-${{ github.run_number }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          if [ "${{ steps.build_config.outputs.BUILD_TYPE }}" == "development" ]; then
+            echo "⚠️ **Note:** This is an unsigned development build." >> $GITHUB_STEP_SUMMARY
+          else
+            echo "✅ This is a signed App Store build ready for TestFlight." >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Clean up keychain
+        if: always() && steps.build_config.outputs.BUILD_TYPE == 'appstore'
+        run: |
+          if [ -n "$KEYCHAIN_PATH" ] && [ -f "$KEYCHAIN_PATH" ]; then
+            security delete-keychain "$KEYCHAIN_PATH" || true
+          fi
         if: steps.build_config.outputs.BUILD_TYPE == 'appstore'
         working-directory: repo/admin-app/ios
         env:
